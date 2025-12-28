@@ -29,6 +29,7 @@
         <div>Gate: <input type="range" id="threshSlider" min="5" max="100" value="20"></div>
         <div>Smooth: <input type="range" id="smoothSlider" min="1" max="20" value="8"></div>
         <div>History: <input type="range" id="winSlider" min="1" max="20" value="5">s</div>
+        <div>Ref: <input type="range" id="refSlider" min="430" max="450" value="440"> <span id="refDisplay">A=440 Hz</span></div>
     </div>
 </header>
 
@@ -52,6 +53,9 @@
 
 <script>
     let audioCtx, analyser, smoothing = 8, threshold = 20, winDur = 5000;
+    let stream = null;
+    let animationFrameId = null;
+    let pitchReference = 440;
     const history = {};
     const pitchBuffer = [];
     const NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -89,15 +93,57 @@
     document.getElementById('threshSlider').oninput = (e) => threshold = e.target.value;
     document.getElementById('smoothSlider').oninput = (e) => smoothing = parseInt(e.target.value);
     document.getElementById('winSlider').oninput = (e) => winDur = e.target.value * 1000;
+    document.getElementById('refSlider').oninput = (e) => {
+        pitchReference = parseFloat(e.target.value);
+        document.getElementById('refDisplay').innerText = `A=${pitchReference} Hz`;
+    };
 
     document.getElementById('startBtn').onclick = async () => {
-        audioCtx = new AudioContext();
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioCtx.createMediaStreamSource(stream).connect(analyser = audioCtx.createAnalyser());
-        analyser.fftSize = 2048;
-        document.getElementById('startBtn').style.display = 'none';
-        initStaff();
-        render();
+        const btn = document.getElementById('startBtn');
+
+        // If currently monitoring, stop it
+        if (animationFrameId !== null) {
+            // Stop animation loop
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+
+            // Stop media stream tracks
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+
+            // Close audio context
+            if (audioCtx) {
+                await audioCtx.close();
+                audioCtx = null;
+            }
+
+            // Clear analyser
+            analyser = null;
+
+            // Reset UI state
+            resetUI();
+
+            // Update button
+            btn.innerText = 'Start Analyzer';
+
+        } else {
+            // Start monitoring
+            audioCtx = new AudioContext();
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioCtx.createMediaStreamSource(stream).connect(analyser = audioCtx.createAnalyser());
+            analyser.fftSize = 2048;
+
+            // Initialize display
+            initStaff();
+
+            // Update button
+            btn.innerText = 'Stop Analyzer';
+
+            // Start render loop
+            render();
+        }
     };
 
     function initStaff() {
@@ -113,6 +159,40 @@
             let y = 60 + i * 20;
             ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
         }
+    }
+
+    function resetUI() {
+        // Clear canvas
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawStaffStatic();
+        staffX = 60;
+
+        // Reset note display
+        document.getElementById('noteDisplay').innerText = '--';
+        document.getElementById('centsDisplay').innerText = '0c';
+        document.getElementById('needle').style.left = '50%';
+
+        // Clear history data
+        for (let m in history) {
+            history[m] = [];
+        }
+
+        // Reset heatmap display
+        for (let m = 55; m <= 83; m++) {
+            const lbl = document.getElementById(`L-${m}`);
+            const rng = document.getElementById(`R-${m}`);
+            const dot = document.getElementById(`D-${m}`);
+            const hit = document.getElementById(`H-${m}`);
+            if (lbl) lbl.style.color = 'var(--text)';
+            if (rng) rng.style.width = '0%';
+            if (dot) dot.style.display = 'none';
+            if (hit) hit.innerText = '0';
+        }
+
+        // Clear pitch buffer and tracking
+        pitchBuffer.length = 0;
+        lastPlottedMidi = null;
+        wasSilent = true;
     }
 
     function plotNote(midi, color) {
@@ -146,7 +226,7 @@
     }
 
     function render() {
-        requestAnimationFrame(render);
+        animationFrameId = requestAnimationFrame(render);
         if (!analyser) return;
         const buf = new Float32Array(analyser.frequencyBinCount);
         analyser.getFloatTimeDomainData(buf);
@@ -160,7 +240,7 @@
                 pitchBuffer.push(freq);
                 if (pitchBuffer.length > smoothing) pitchBuffer.shift();
                 const avgF = pitchBuffer.reduce((a,b)=>a+b,0) / pitchBuffer.length;
-                const n = 12 * Math.log2(avgF/440) + 69;
+                const n = 12 * Math.log2(avgF/pitchReference) + 69;
                 const midi = Math.round(n);
                 const cents = (n - midi) * 100;
 
