@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Violin Studio - Smart Note Plotting</title>
+    <style>
+        :root { --bg: #0d0d0f; --surface: #1a1a20; --primary: #bb86fc; --secondary: #03dac6; --text: #e0e0e0; --perfect: #4caf50; --warning: #ffb74d; --danger: #ef5350; }
+        body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; overflow: hidden; height: 100vh; display: flex; flex-direction: column; align-items: center; }
+        header { width: 100%; background: var(--surface); padding: 10px; display: flex; flex-direction: column; align-items: center; box-shadow: 0 4px 10px rgba(0,0,0,0.5); z-index: 10;}
+        .controls-row { display: flex; gap: 20px; font-size: 0.8rem; margin-top: 5px; }
+        .main-layout { display: grid; grid-template-columns: 1fr 350px; gap: 20px; width: 95%; flex-grow: 1; margin: 15px; min-height: 0; }
+        .card { background: var(--surface); border-radius: 12px; padding: 15px; display: flex; flex-direction: column; }
+        #staffCanvas { background: #fff; border-radius: 8px; width: 100%; height: 220px; margin-bottom: 15px; }
+        .note-display { font-size: 5rem; font-weight: 900; color: var(--primary); text-align: center; margin: 0; }
+        .history-list { overflow-y: auto; flex-grow: 1; }
+        .note-row { display: flex; align-items: center; height: 24px; font-family: monospace; font-size: 0.8rem; }
+        .note-label { width: 45px; }
+        .diverging-bar { flex-grow: 1; height: 8px; background: #2a2a2a; position: relative; margin: 0 10px; border-radius: 4px; }
+        .bar-range { position: absolute; height: 100%; background: rgba(187, 134, 252, 0.2); }
+        .bar-dot { position: absolute; width: 6px; height: 6px; background: #fff; border-radius: 50%; top: 1px; transform: translateX(-50%); }
+        button { background: var(--primary); border: none; padding: 8px 20px; border-radius: 20px; font-weight: bold; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+<header>
+    <button id="startBtn">Start Analyzer</button>
+    <div class="controls-row">
+        <div>Gate: <input type="range" id="threshSlider" min="5" max="100" value="20"></div>
+        <div>Smooth: <input type="range" id="smoothSlider" min="1" max="20" value="8"></div>
+        <div>History: <input type="range" id="winSlider" min="1" max="20" value="5">s</div>
+    </div>
+</header>
+
+<div class="main-layout">
+    <div style="display: flex; flex-direction: column; gap: 15px;">
+        <canvas id="staffCanvas"></canvas>
+        <div class="card" style="justify-content:center;">
+            <h2 id="noteDisplay" class="note-display">--</h2>
+            <div id="centsDisplay" style="text-align:center;">0 cents</div>
+            <div style="width:70%; height:4px; background:#333; margin:15px auto; position:relative;">
+                <div id="needle" style="position:absolute; left:50%; top:-10px; width:3px; height:24px; background:var(--secondary);"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h4 style="margin:0 0 10px 0">Intonation Heatmap</h4>
+        <div class="history-list" id="noteList"></div>
+    </div>
+</div>
+
+<script>
+    let audioCtx, analyser, smoothing = 8, threshold = 20, winDur = 5000;
+    const history = {};
+    const pitchBuffer = [];
+    const NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+    
+    // Tracking for repeated notes
+    let lastPlottedMidi = null;
+    let wasSilent = true;
+
+    // Staff Config
+    const canvas = document.getElementById('staffCanvas');
+    const ctx = canvas.getContext('2d');
+    let staffX = 60;
+
+    const midiToStaffY = {
+        55: 190, 56: 190, 57: 180, 58: 180, 59: 170, 
+        60: 160, 61: 160, 62: 150, 63: 150, 64: 140, 
+        65: 130, 66: 130, 67: 120, 68: 120, 69: 110, 70: 110, 
+        71: 100, 72: 90, 73: 90, 74: 80, 75: 80, 
+        76: 70, 77: 60, 78: 60, 79: 50, 80: 50, 
+        81: 40, 82: 40, 83: 30
+    };
+
+    // Build Heatmap UI
+    const list = document.getElementById('noteList');
+    for (let i = 83; i >= 55; i--) {
+        history[i] = [];
+        const row = document.createElement('div');
+        row.className = 'note-row';
+        row.innerHTML = `<div class="note-label" id="L-${i}">${NOTES[i%12]}${Math.floor(i/12)-1}</div>
+            <div class="diverging-bar"><div class="bar-range" id="R-${i}"></div><div class="bar-dot" id="D-${i}" style="display:none"></div></div>
+            <div style="width:25px; opacity:0.5; text-align:right;" id="H-${i}">0</div>`;
+        list.appendChild(row);
+    }
+
+    document.getElementById('threshSlider').oninput = (e) => threshold = e.target.value;
+    document.getElementById('smoothSlider').oninput = (e) => smoothing = parseInt(e.target.value);
+    document.getElementById('winSlider').oninput = (e) => winDur = e.target.value * 1000;
+
+    document.getElementById('startBtn').onclick = async () => {
+        audioCtx = new AudioContext();
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx.createMediaStreamSource(stream).connect(analyser = audioCtx.createAnalyser());
+        analyser.fftSize = 2048;
+        document.getElementById('startBtn').style.display = 'none';
+        initStaff();
+        render();
+    };
+
+    function initStaff() {
+        canvas.width = canvas.offsetWidth;
+        canvas.height = canvas.offsetHeight;
+        drawStaffStatic();
+    }
+
+    function drawStaffStatic() {
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        for (let i = 0; i < 5; i++) {
+            let y = 60 + i * 20;
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+        }
+    }
+
+    function plotNote(midi, color) {
+        const y = midiToStaffY[midi];
+        const isSharp = NOTES[midi % 12].includes('#');
+
+        ctx.strokeStyle = '#999';
+        if (midi <= 60) {
+            for (let ly = 160; ly <= y; ly += 20) {
+                ctx.beginPath(); ctx.moveTo(staffX - 12, ly); ctx.lineTo(staffX + 12, ly); ctx.stroke();
+            }
+        }
+
+        if (isSharp) {
+            ctx.fillStyle = color;
+            ctx.font = 'bold 20px serif';
+            ctx.fillText('♯', staffX - 22, y + 7);
+        }
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.ellipse(staffX, y, 8, 6, Math.PI / -4, 0, 2 * Math.PI);
+        ctx.fill();
+
+        staffX += 35;
+        if (staffX > canvas.width - 30) {
+            staffX = 60;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawStaffStatic();
+        }
+    }
+
+    function render() {
+        requestAnimationFrame(render);
+        if (!analyser) return;
+        const buf = new Float32Array(analyser.frequencyBinCount);
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0; for (let i=0; i<buf.length; i++) sum += buf[i]*buf[i];
+        const vol = Math.sqrt(sum/buf.length) * 1000;
+        const now = Date.now();
+
+        if (vol > threshold) {
+            const freq = autoCorrelate(buf, audioCtx.sampleRate);
+            if (freq !== -1) {
+                pitchBuffer.push(freq);
+                if (pitchBuffer.length > smoothing) pitchBuffer.shift();
+                const avgF = pitchBuffer.reduce((a,b)=>a+b,0) / pitchBuffer.length;
+                const n = 12 * Math.log2(avgF/440) + 69;
+                const midi = Math.round(n);
+                const cents = (n - midi) * 100;
+
+                if (history[midi]) {
+                    history[midi].push({t: now, c: cents});
+                    document.getElementById('noteDisplay').innerText = NOTES[midi%12] + (Math.floor(midi/12)-1);
+                    document.getElementById('centsDisplay').innerText = Math.round(cents) + "c";
+                    document.getElementById('needle').style.left = (50 + cents/2) + "%";
+
+                    // LOGIC: Should we plot?
+                    // Plot if midi changed OR if we just came back from silence
+                    if (midi !== lastPlottedMidi || wasSilent) {
+                        const absC = Math.abs(cents);
+                        let color = absC < 5 ? '#4caf50' : (absC < 15 ? '#ffb74d' : '#ef5350');
+                        plotNote(midi, color);
+                        lastPlottedMidi = midi;
+                    }
+                    wasSilent = false;
+                }
+            }
+        } else {
+            // Volume is below threshold: Set silence flag
+            wasSilent = true;
+        }
+
+        // Update Heatmap
+        for (let m in history) {
+            history[m] = history[m].filter(d => now - d.t < winDur);
+            const d = history[m], lbl = document.getElementById(`L-${m}`), rng = document.getElementById(`R-${m}`), dot = document.getElementById(`D-${m}`), hit = document.getElementById(`H-${m}`);
+            if (d.length > 0) {
+                const c = d.map(x=>x.c), avg = c.reduce((a,b)=>a+b,0)/d.length, min = Math.min(...c), max = Math.max(...c);
+                lbl.style.color = Math.abs(avg) < 5 ? 'var(--secondary)' : (Math.abs(avg) < 15 ? 'var(--warning)' : 'var(--danger)');
+                rng.style.left = (50 + min/2) + "%"; rng.style.width = ((max-min)/2) + "%";
+                dot.style.display = 'block'; dot.style.left = (50 + avg/2) + "%";
+                hit.innerText = d.length;
+            } else {
+                lbl.style.color = 'var(--text)'; rng.style.width = "0%"; dot.style.display = 'none'; hit.innerText = "0";
+            }
+        }
+    }
+
+    function autoCorrelate(buf, sr) {
+        let SIZE = buf.length, c = new Float32Array(SIZE).fill(0);
+        for (let i=0; i<SIZE; i++) for (let j=0; j<SIZE-i; j++) c[i] = c[i] + buf[j]*buf[j+i];
+        let d=0; while (c[d]>c[d+1]) d++;
+        let maxv=-1, maxp=-1;
+        for (let i=d; i<SIZE; i++) { if (c[i]>maxv) { maxv=c[i]; maxp=i; } }
+        if (maxv < 0.5 * c[0]) return -1; 
+        return sr/maxp;
+    }
+</script>
+</body>
+</html>
